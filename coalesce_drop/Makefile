@@ -1,4 +1,5 @@
 KOKKOS_PATH = ${HOME}/kokkos
+KOKKOSKERNELS_PATH = ${HOME}/kokkos-kernels
 KOKKOS_DEVICES = "OpenMP"
 EXE_NAME = "01_Exercise"
 
@@ -29,19 +30,20 @@ OBJ = $(SRC:.cpp=.o)
 LIB =
 
 include $(KOKKOS_PATH)/Makefile.kokkos
+include $(KOKKOSKERNELS_PATH)/Makefile.kokkos-kernels
 
 build: $(EXE)
 
-$(EXE): $(OBJ) $(KOKKOS_LINK_DEPENDS)
-	$(LINK) $(KOKKOS_LDFLAGS) $(LINKFLAGS) $(EXTRA_PATH) $(OBJ) $(KOKKOS_LIBS) $(LIB) -o $(EXE)
+$(EXE): $(OBJ) $(KOKKOS_LINK_DEPENDS) $(KOKKOSKERNELS_LINK_DEPENDS)
+	$(LINK) $(KOKKOS_LDFLAGS) $(LINKFLAGS) $(EXTRA_PATH) $(OBJ) $(KOKKOSKERNELS_LIBS) $(KOKKOS_LIBS) $(LIB) -o $(EXE)
 
-clean: kokkos-clean
+clean: kokkos-clean kokkoskernels-clean
 	rm -f *.o *.cuda *.host
 
 # Compilation rules
 
-%.o:%.cpp $(KOKKOS_CPP_DEPENDS)
-	$(CXX) $(KOKKOS_CPPFLAGS) $(KOKKOS_CXXFLAGS) $(CXXFLAGS) $(EXTRA_INC) -c $<
+%.o:%.cpp $(KOKKOS_CPP_DEPENDS) $(KOKKOSKERNELS_CPP_DEPENDS)
+	$(CXX) $(KOKKOS_CPPFLAGS) $(KOKKOSKERNELS_CPPFLAGS) $(KOKKOS_CXXFLAGS) $(KOKKOSKERNELS_CXXFLAGS) $(CXXFLAGS) $(EXTRA_INC) -c $<
 
 test: $(EXE)
 	./$(EXE)
