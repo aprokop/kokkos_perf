@@ -1,7 +1,7 @@
 KOKKOS_PATH = ${HOME}/kokkos
 KOKKOSKERNELS_PATH = ${HOME}/kokkos-kernels
 KOKKOS_DEVICES = "OpenMP"
-EXE_NAME = "01_Exercise"
+EXE_NAME = "coalesce_drop"
 
 SRC = $(wildcard *.cpp)
 
