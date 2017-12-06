@@ -6,42 +6,32 @@
 
 #include <iostream>
 
-template<class scalar_type, class local_ordinal_type, class device_type>
+template<class local_ordinal_type, class device_type>
 class LWGraph_kokkos {
 public:
-  typedef Kokkos::StaticCrsGraph<local_ordinal_type, Kokkos::LayoutLeft, device_type>   local_graph_type;
-  typedef Kokkos::View<bool*, device_type>                                              boundary_nodes_type;
+  typedef Kokkos::StaticCrsGraph<local_ordinal_type, Kokkos::LayoutLeft, device_type> local_graph_type;
 
 public:
   LWGraph_kokkos(const local_graph_type& graph) : graph_(graph) { }
   ~LWGraph_kokkos() { }
 
-  //! Set boolean array indicating which rows correspond to Dirichlet boundaries.
-  KOKKOS_INLINE_FUNCTION
-  void setBoundaryNodeMap(const boundary_nodes_type bndry) {
-    dirichletBoundaries_ = bndry;
-  }
-
 private:
   //! Underlying graph (with label)
   const local_graph_type graph_;
-
-  //! Boolean array marking Dirichlet rows.
-  boundary_nodes_type dirichletBoundaries_;
 };
 
-template<class local_ordinal_type, class GhostedViewType>
+template<class local_ordinal_type, class DiagViewType>
 class ClassicalDropFunctor {
 private:
-  typedef typename GhostedViewType::value_type      scalar_type;
-  typedef          Kokkos::ArithTraits<scalar_type>          ATS;
-  typedef typename ATS::magnitudeType               magnitudeType;
+  using scalar_type     = typename DiagViewType::value_type;
+  using ATS             = Kokkos::ArithTraits<scalar_type>;
+  using magnitudeType   = typename ATS::magnitudeType;
 
-  GhostedViewType   diag;   // corresponds to overlapped diagonal multivector (2D View)
-  magnitudeType     eps;
+  DiagViewType  diag;   // corresponds to overlapped diagonal multivector (2D View)
+  magnitudeType eps;
 
 public:
-  ClassicalDropFunctor(GhostedViewType ghostedDiag, magnitudeType threshold) :
+  ClassicalDropFunctor(DiagViewType ghostedDiag, magnitudeType threshold) :
       diag(ghostedDiag),
       eps(threshold)
   { }
@@ -120,7 +110,7 @@ private:
   magnitudeType     eps;
 };
 
-template<class scalar_type, class local_ordinal_type, class MatrixType, class BndViewType, class DropFunctorType>
+template<class scalar_type, class local_ordinal_type, class MatrixType, class DropFunctorType>
 class ScalarFunctor {
 private:
   typedef typename MatrixType::StaticCrsGraphType   graph_type;
@@ -131,13 +121,12 @@ private:
   typedef typename ATS::magnitudeType               magnitudeType;
 
 public:
-  ScalarFunctor(MatrixType A_, BndViewType bndNodes_, DropFunctorType dropFunctor_,
+  ScalarFunctor(MatrixType A_, DropFunctorType dropFunctor_,
                 typename rows_type::non_const_type rows_,
                 typename cols_type::non_const_type colsAux_,
                 typename vals_type::non_const_type valsAux_,
                 bool reuseGraph_, bool lumping_, scalar_type threshold_) :
       A(A_),
-      bndNodes(bndNodes_),
       dropFunctor(dropFunctor_),
       rows(rows_),
       colsAux(colsAux_),
@@ -191,20 +180,11 @@ public:
       valsAux(offset+diagID) += diag;
     }
 
-    // If the only element remaining after filtering is diagonal, mark node as boundary
-    // FIXME: this should really be replaced by the following
-    //    if (indices.size() == 1 && indices[0] == row)
-    //        boundaryNodes[row] = true;
-    // We do not do it this way now because there is no framework for distinguishing isolated
-    // and boundary nodes in the aggregation algorithms
-    bndNodes(row) = (rownnz == 1);
-
     nnz += rownnz;
   }
 
 private:
   MatrixType                            A;
-  BndViewType                           bndNodes;
   DropFunctorType                       dropFunctor;
 
   rows_type                             rowsA;
@@ -215,115 +195,84 @@ private:
 
   bool                                  reuseGraph;
   bool                                  lumping;
-  scalar_type                                    zero;
+  scalar_type                           zero;
 };
 
 template<class scalar_type, class local_ordinal_type, class device_type>
-void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type> A) {
-  typedef typename LWGraph_kokkos<scalar_type,local_ordinal_type,device_type>::local_graph_type                 kokkos_graph_type;
-  typedef KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type>   local_matrix_type;
-  typedef typename kokkos_graph_type::row_map_type::non_const_type  rows_type;
-  typedef typename kokkos_graph_type::entries_type::non_const_type  cols_type;
-  typedef typename local_matrix_type::values_type::non_const_type   vals_type;
-  typedef          Kokkos::ArithTraits<scalar_type>                 ATS;
-  typedef typename ATS::mag_type                                    magnitude_type;
-  typedef Kokkos::View<bool*, device_type>                          boundary_nodes_type;
+void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type> A, const std::string& algo, scalar_type threshold, bool lumping) {
+  using local_matrix_type = KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type>;
+  using kokkos_graph_type = typename LWGraph_kokkos<local_ordinal_type,device_type>::local_graph_type;
+  using rows_type         = typename kokkos_graph_type::row_map_type::non_const_type;
+  using cols_type         = typename kokkos_graph_type::entries_type::non_const_type;
+  using vals_type         = typename local_matrix_type::values_type::non_const_type;
+  using ATS               = Kokkos::ArithTraits<scalar_type>;
+  using magnitude_type    = typename ATS::mag_type;
 
-    typedef Kokkos::RangePolicy<typename local_matrix_type::execution_space> range_type;
+  typedef Kokkos::RangePolicy<typename local_matrix_type::execution_space> range_type;
 
   auto numRows = A.numRows();
   auto nnzA    = A.nnz();
   auto rowsA   = A.graph.row_map;
 
-  scalar_type threshold = 0.05;
+  const bool reuseGraph = false;
 
-  bool reuseGraph = false; // FIXME
-  bool lumping    = true;  // FIXME
-  if (lumping)
-    std::cout << "Lumping dropped entries" << std::endl;
-
-  // FIXME_KOKKOS: replace by ViewAllocateWithoutInitializing + setting a single value
-  rows_type rows   ("FA_rows",     numRows+1);
+  // FIXME: replace by ViewAllocateWithoutInitializing + setting a single value
+  rows_type rows   (                                        "FA_rows",      numRows+1);
   cols_type colsAux(Kokkos::ViewAllocateWithoutInitializing("FA_aux_cols"), nnzA);
   vals_type valsAux(Kokkos::ViewAllocateWithoutInitializing("FA_aux_vals"), nnzA);
 
-  typename boundary_nodes_type::non_const_type bndNodes(Kokkos::ViewAllocateWithoutInitializing("boundary_nodes"), numRows);
-
   local_ordinal_type nnzFA = 0;
 
-  // FIXME: make it command-line argument
-  std::string algo = "classical";
   if (algo == "classical") {
     // Construct overlapped matrix diagonal
-    Kokkos::View<double*,device_type> ghostedDiagView("ghosted_diag", numRows);
-    // FIXME: fill in ghostedDiag with the matrix diag values
+    Kokkos::View<double**,device_type> ghostedDiagView("ghosted_diag", numRows, 1);             // MultiVector
+    // FIXME: extract matrix diagonal
 
-    // Filter out entries
-    {
-      // FIXME: timers
-      // SubFactoryMonitor m2(*this, "MainLoop", currentLevel);
+    ClassicalDropFunctor<local_ordinal_type, decltype(ghostedDiagView)> dropFunctor(ghostedDiagView, threshold);
+    ScalarFunctor<scalar_type, local_ordinal_type, local_matrix_type, decltype(dropFunctor)>
+        scalarFunctor(A, dropFunctor, rows, colsAux, valsAux, reuseGraph, lumping, threshold);
 
-      ClassicalDropFunctor<local_ordinal_type, decltype(ghostedDiagView)> dropFunctor(ghostedDiagView, threshold);
-      ScalarFunctor<scalar_type, local_ordinal_type, local_matrix_type, decltype(bndNodes), decltype(dropFunctor)>
-          scalarFunctor(A, bndNodes, dropFunctor, rows, colsAux, valsAux, reuseGraph, lumping, threshold);
-
-      Kokkos::parallel_reduce("MueLu:CoalesceDropF:Build:scalar_filter:main_loop", range_type(0,numRows),
-                              scalarFunctor, nnzFA);
-    }
+    Kokkos::parallel_reduce("main_loop", range_type(0,numRows), scalarFunctor, nnzFA);
 
   } else if (algo == "distance laplacian") {
-      // FIXME: create some coordinates
-    Kokkos::View<scalar_type*[3],device_type> ghostedCoordsView("ghosted_coords", numRows);
+    // FIXME: create some coordinates
+    Kokkos::View<scalar_type**,device_type> ghostedCoordsView("ghosted_coords", numRows, 3); // MultiVector
 
     DistanceFunctor<local_ordinal_type, decltype(ghostedCoordsView)> distFunctor(ghostedCoordsView);
 
-    Kokkos::View<scalar_type*,device_type> lapl_diag("lap_diag", numRows);
-      // Construct Laplacian diagonal
-      {
-        // FIXME timers
-        // SubFactoryMonitor m2(*this, "Local Laplacian diag construction", currentLevel);
+    Kokkos::View<scalar_type*,device_type> lapl_diag("lapl_diag", numRows);
 
-        auto kokkosGraph = A.graph;
+    // Construct Laplacian diagonal
+    Kokkos::parallel_for("construct_lapl_diag", range_type(0,numRows),
+      KOKKOS_LAMBDA(const local_ordinal_type row) {
+        auto rowView = A.graph.rowConst(row);
+        auto length  = rowView.length;
 
-        Kokkos::parallel_for("laplacian_diag", range_type(0,numRows),
-          KOKKOS_LAMBDA(const local_ordinal_type row) {
-            auto rowView = kokkosGraph.rowConst(row);
-            auto length  = rowView.length;
+        scalar_type d = ATS::zero();
+        for (decltype(length) colID = 0; colID < length; colID++) {
+          auto col = rowView(colID);
+          if (row != col)
+            d += ATS::one()/distFunctor.distance2(row, col);
+        }
+        lapl_diag(row,0) = d;
+      });
 
-            scalar_type d = ATS::zero();
-            for (decltype(length) colID = 0; colID < length; colID++) {
-              auto col = rowView(colID);
-              if (row != col)
-                d += ATS::one()/distFunctor.distance2(row, col);
-            }
-            lapl_diag(row,0) = d;
-          });
-      }
+    // Filter out entries
+    DistanceLaplacianDropFunctor<local_ordinal_type, decltype(lapl_diag), decltype(distFunctor)>
+        dropFunctor(lapl_diag, distFunctor, threshold);
+    ScalarFunctor<scalar_type, local_ordinal_type, local_matrix_type, decltype(dropFunctor)>
+        scalarFunctor(A, dropFunctor, rows, colsAux, valsAux, reuseGraph, lumping, threshold);
 
-      // Filter out entries
-      {
-        // FIXME: time this section
-        // SubFactoryMonitor m2(*this, "MainLoop", currentLevel);
-        DistanceLaplacianDropFunctor<local_ordinal_type, decltype(lapl_diag), decltype(distFunctor)>
-            dropFunctor(lapl_diag, distFunctor, threshold);
-        ScalarFunctor<scalar_type, local_ordinal_type, local_matrix_type, decltype(bndNodes), decltype(dropFunctor)>
-            scalarFunctor(A, bndNodes, dropFunctor, rows, colsAux, valsAux, reuseGraph, lumping, threshold);
-
-        Kokkos::parallel_reduce("main_loop", range_type(0,numRows), scalarFunctor, nnzFA);
-      }
-    }
-
-  {
-    // FIXME: time this section
-
-    // parallel_scan (exclusive)
-    Kokkos::parallel_scan("compress_rows", range_type(0,numRows+1),
-      KOKKOS_LAMBDA(const local_ordinal_type i, local_ordinal_type& update, const bool& final_pass) {
-        update += rows(i);
-        if (final_pass)
-          rows(i) = update;
-    });
+    Kokkos::parallel_reduce("main_loop", range_type(0,numRows), scalarFunctor, nnzFA); // -> scan
   }
+
+  // parallel_scan (exclusive)
+  Kokkos::parallel_scan("compress_rows", range_type(0,numRows+1),
+    KOKKOS_LAMBDA(const local_ordinal_type i, local_ordinal_type& update, const bool& final_pass) {
+      update += rows(i);
+      if (final_pass)
+        rows(i) = update;
+  });
 
   // Compress cols (and optionally vals)
   // We use a trick here: we moved all remaining elements to the beginning
@@ -332,207 +281,153 @@ void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordi
   // per row.
   cols_type cols(Kokkos::ViewAllocateWithoutInitializing("FA_cols"), nnzFA);
   vals_type vals(Kokkos::ViewAllocateWithoutInitializing("FA_vals"), nnzFA);
-  {
-    // FIXME: time this section
-    // SubFactoryMonitor m2(*this, "CompressColsAndVals", currentLevel);
-
-    // Compress cols and vals
-
-    Kokkos::parallel_for("compress_cols_and_vals", range_type(0,numRows),
-      KOKKOS_LAMBDA(const local_ordinal_type i) {
-        local_ordinal_type rowStart  = rows(i);
-        local_ordinal_type rowAStart = rowsA(i);
-        size_t rownnz = rows(i+1) - rows(i);
-        for (size_t j = 0; j < rownnz; j++) {
-          cols(rowStart+j) = colsAux(rowAStart+j);
-          vals(rowStart+j) = colsAux(rowAStart+j);
-        }
-    });
-  }
+  Kokkos::parallel_for("compress_cols_and_vals", range_type(0,numRows),
+    KOKKOS_LAMBDA(const local_ordinal_type i) {
+      local_ordinal_type rowStart  = rows(i);
+      local_ordinal_type rowAStart = rowsA(i);
+      size_t rownnz = rows(i+1) - rows(i);
+      for (size_t j = 0; j < rownnz; j++) {
+        cols(rowStart+j) = colsAux(rowAStart+j);
+        vals(rowStart+j) = colsAux(rowAStart+j);
+      }
+  });
 
   kokkos_graph_type kokkosGraph(cols, rows);
-
-
-
-
-  // Stage 0: detect Dirichlet rows
-  boundary_nodes_type boundaryNodes("boundaryNodes", numRows);
-
-  double tol = 0.0;
-  Kokkos::parallel_for("detect_d_rows", range_type(0, numRows),
-    KOKKOS_LAMBDA(const local_ordinal_type row) {
-      auto rowView = A.row(row);
-      auto length  = rowView.length;
-
-      boundaryNodes(row) = true;
-      for (decltype(length) colID = 0; colID < length; colID++)
-        if ((rowView.colidx(colID) != row) && (ATS::magnitude(rowView.value(colID)) > tol)) {
-          boundaryNodes(row) = false;
-          break;
-        }
-  });
 }
 
-  template<class scalar_type, class local_ordinal_type, class device_type>
-  void kernel_coalesce_drop_serial(KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type> A) {
-    typedef KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type>   local_matrix_type;
-    typedef Kokkos::ArithTraits<scalar_type>                                  ATS;
-    typedef typename ATS::mag_type                                            magnitude_type;
-    typedef Kokkos::View<bool*, device_type>                                  boundary_nodes_type;
+template<class scalar_type, class local_ordinal_type, class device_type>
+KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type>
+kernel_construct(local_ordinal_type numRows) {
+  auto numCols         = numRows;
+  auto nnz             = 10*numRows;
 
-    auto numRows = A.numRows();
+  auto varianz_nel_row = 0.2*nnz/numRows;
+  auto width_row       = 0.01*numRows;
 
-    scalar_type eps = 0.05;
+  auto elements_per_row = nnz/numRows;
 
-    typedef Kokkos::RangePolicy<typename local_matrix_type::execution_space> range_type;
+  auto rowPtr = new local_ordinal_type[numRows+1];
+  rowPtr[0] = 0;
+  for (int row = 0; row < numRows; row++) {
+    int varianz = (1.0*rand()/INT_MAX-0.5)*varianz_nel_row;
 
-    // Stage 0: detect Dirichlet rows
-    boundary_nodes_type boundaryNodes("boundaryNodes", numRows);
-    for (int row = 0; row < numRows; row++) {
-      auto rowView = A.row (row);
-      auto length  = rowView.length;
+    rowPtr[row+1] = rowPtr[row] + elements_per_row + varianz;
+  }
+  nnz = rowPtr[numRows];
 
-      boundaryNodes(row) = true;
-      for (decltype(length) colID = 0; colID < length; colID++)
-        if ((rowView.colidx(colID) != row) && (ATS::magnitude(rowView.value(colID)) > 1e-13)) {
-          boundaryNodes(row) = false;
-          break;
-        }
+  auto colInd = new local_ordinal_type[nnz];
+  auto values = new scalar_type       [nnz];
+  for (int row = 0; row < numRows; row++) {
+    for (int k = rowPtr[row]; k < rowPtr[row+1]; k++) {
+      int pos = row + (1.0*rand()/INT_MAX-0.5)*width_row;
+
+      if (pos <  0)       pos += numCols;
+      if (pos >= numCols) pos -= numCols;
+      colInd[k] = pos;
+      values[k] = 100.0*rand()/INT_MAX - 50.0;
     }
   }
 
-  template<class scalar_type, class local_ordinal_type, class device_type>
-      KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type>
-      kernel_construct(local_ordinal_type numRows) {
-        auto numCols         = numRows;
-        auto nnz             = 10*numRows;
+  typedef KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type> local_matrix_type;
 
-        auto varianz_nel_row = 0.2*nnz/numRows;
-        auto width_row       = 0.01*numRows;
+  return local_matrix_type("A", numRows, numCols, nnz, values, rowPtr, colInd, false/*pad*/);
+}
 
-        auto elements_per_row = nnz/numRows;
+template<class scalar_type, class local_ordinal_type, class device_type>
+int main_(int argc, char **argv) {
+  int n         = 100000;
+  int num_loops = 10;
 
-        auto rowPtr = new local_ordinal_type[numRows+1];
-        rowPtr[0] = 0;
-        for (int row = 0; row < numRows; row++) {
-          int varianz = (1.0*rand()/INT_MAX-0.5)*varianz_nel_row;
+  bool lumping = true;
+  scalar_type eps = 0.05;
+  std::string algo = "classical";
 
-          rowPtr[row+1] = rowPtr[row] + elements_per_row + varianz;
-        }
-        nnz = rowPtr[numRows];
+  for (int i = 1; i < argc; i++) {
+    if      (strcmp(argv[i], "-n") == 0)                                   { n    = atoi(argv[++i]); continue; }
+    else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--num_loops") == 0) { num_loops = atoi(argv[++i]); continue; }
+    else if (strcmp(argv[i], "--node") == 0)                               { i++; continue; }
+    else if (strcmp(argv[i], "--lumping") == 0)                            { i++; lumping = true; continue; }
+    else if (strcmp(argv[i], "--no-lumping") == 0)                         { i++; lumping = false; continue; }
+    else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--algo") == 0) { algo = argv[++i]; continue; }
+    else if (strcmp(argv[i], "-e") == 0 || strcmp(argv[i], "--eps") == 0)  { eps = atof(argv[++i]); continue; }
+    else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+      std::cout << "./coalesce_drop.exe [-n <matrix_size>] [-l <number_of_loops>]" << std::endl;
+      return 0;
+    } else {
+      throw std::runtime_error(std::string("Uknown option: ") + argv[i]);
+    }
+  }
+  if (algo != "classical" && algo != "distance_laplacian")
+    throw std::runtime_error("Unknown algo: \"" + algo + "\"");
 
-        auto colInd = new local_ordinal_type[nnz];
-        auto values = new scalar_type       [nnz];
-        for (int row = 0; row < numRows; row++) {
-          for (int k = rowPtr[row]; k < rowPtr[row+1]; k++) {
-            int pos = row + (1.0*rand()/INT_MAX-0.5)*width_row;
+  std::cout << "n = " << n << ", num_loops = " << num_loops << ", algo = " << algo << ", eps = " << eps << ", lumping = " << lumping << std::endl;
 
-            if (pos <  0)       pos += numCols;
-            if (pos >= numCols) pos -= numCols;
-            colInd[k] = pos;
-            values[k] = 100.0*rand()/INT_MAX - 50.0;
-          }
-        }
+  typedef typename device_type::execution_space execution_space;
 
-        typedef KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type> local_matrix_type;
+  auto A = kernel_construct<scalar_type, local_ordinal_type, device_type>(n);
 
-        return local_matrix_type("A", numRows, numCols, nnz, values, rowPtr, colInd, false/*pad*/);
-      }
+  {
+    execution_space::fence();
+    Kokkos::Impl::Timer timer;
 
-  template<class scalar_type, class local_ordinal_type, class device_type>
-      int main_(int argc, char **argv) {
-        int n    = 100000;
-        int loop = 10;
+    for (int i = 0; i < num_loops; i++)
+      kernel_coalesce_drop_device(A, algo, eps, lumping);
 
-        for (int i = 1; i < argc; i++) {
-          if      (strcmp(argv[i], "-n") == 0)                                   { n    = atoi(argv[++i]); continue; }
-          else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--loop") == 0) { loop = atoi(argv[++i]); continue; }
-          else if (strcmp(argv[i], "--node") == 0)                               { i++; continue; }
-          else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            std::cout << "./coalesce_drop.exe [-n <matrix_size>] [-l <number_of_loops>]" << std::endl;
-            return 0;
-          } else {
-            throw std::runtime_error(std::string("Uknown option: ") + argv[i]);
-          }
-        }
+    double kernel_time = timer.seconds();
+    execution_space::fence();
 
-        typedef KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type> local_matrix_type;
-        typedef typename device_type::execution_space execution_space;
+    printf("kernel_coalesce_drop: %.2e (s)\n", kernel_time / num_loops);
+  }
 
-        local_matrix_type A = kernel_construct<scalar_type, local_ordinal_type, device_type>(n);
+  execution_space::finalize();
 
-        execution_space::fence();
-        Kokkos::Impl::Timer timer;
+  return 0;
+}
 
+int main(int argc, char* argv[]) {
+  Kokkos::initialize(argc, argv);
+
+  srand(13721);
+
+  std::string node;
+  for (int i = 1; i < argc; i++) {
+    if (strncmp(argv[i], "--node=", 7) == 0) {
+      std::cout << "Use --node <node> instead of --node=<node>" << std::endl;
+      Kokkos::finalize();
+      return 0;
+
+    } else if (strncmp(argv[i], "--node", 6) == 0)
+      node = argv[++i];
+  }
+
+  std::cout << "node = " << (node == "" ? "default" : node) << std::endl;
+
+  if (node == "") {
+    return main_<double,int,Kokkos::DefaultExecutionSpace>(argc, argv);
+
+  } else if (node == "serial") {
 #ifdef KOKKOS_HAVE_SERIAL
-        if (typeid(device_type) == typeid(Kokkos::Serial)) {
-          for (int i = 0; i < loop; i++)
-            kernel_coalesce_drop_serial(A);
-
-        } else {
+    return main_<double,int,Kokkos::Serial>(argc, argv);
 #else
-          {
-#endif
-            for (int i = 0; i < loop; i++)
-              kernel_coalesce_drop_device(A);
-          }
-
-          double kernel_time = timer.seconds();
-
-          execution_space::fence();
-
-          printf("kernel_coalesce_drop: %.2e (s)\n", kernel_time / loop);
-
-          execution_space::finalize();
-
-          return 0;
-        }
-
-        int main(int argc, char* argv[]) {
-
-          Kokkos::initialize(argc, argv);
-
-          srand(13721);
-
-          std::string node;
-          for (int i = 1; i < argc; i++) {
-            if (strncmp(argv[i], "--node=", 7) == 0) {
-              std::cout << "Use --node <node> instead of --node=<node>" << std::endl;
-              Kokkos::finalize();
-              return 0;
-
-            } else if (strncmp(argv[i], "--node", 6) == 0)
-              node = argv[++i];
-          }
-
-          std::cout << "node = " << (node == "" ? "default" : node) << std::endl;
-
-          if (node == "") {
-            return main_<double,int,Kokkos::DefaultExecutionSpace>(argc, argv);
-
-          } else if (node == "serial") {
-#ifdef KOKKOS_HAVE_SERIAL
-            return main_<double,int,Kokkos::Serial>(argc, argv);
-#else
-            std::cout << "Error: Serial node type is disabled" << std::endl;
+    std::cout << "Error: Serial node type is disabled" << std::endl;
 #endif
 
-          } else if (node == "openmp") {
+  } else if (node == "openmp") {
 #ifdef KOKKOS_HAVE_OPENMP
-            return main_<double,int,Kokkos::OpenMP>(argc, argv);
+    return main_<double,int,Kokkos::OpenMP>(argc, argv);
 #else
-            std::cout << "Error: OpenMP node type is disabled" << std::endl;
+    std::cout << "Error: OpenMP node type is disabled" << std::endl;
 #endif
 
-          } else if (node == "cuda") {
+  } else if (node == "cuda") {
 #ifdef KOKKOS_HAVE_CUDA
-            return main_<double,int,Kokkos::Cuda>(argc, argv);
+    return main_<double,int,Kokkos::Cuda>(argc, argv);
 #else
-            std::cout << "Error: CUDA node type is disabled" << std::endl;
+    std::cout << "Error: CUDA node type is disabled" << std::endl;
 #endif
-          }
+  }
 
-          Kokkos::finalize();
+  Kokkos::finalize();
 
-          return 0;
-        }
+  return 0;
+}
