@@ -20,6 +20,56 @@ private:
   const local_graph_type graph_;
 };
 
+template<class T1, class T2>
+struct custom_pair {
+  T1 first;
+  T2 second;
+
+  KOKKOS_INLINE_FUNCTION
+  custom_pair() {
+    first  = 0;
+    second = 0;
+  }
+  KOKKOS_INLINE_FUNCTION
+  custom_pair(const custom_pair& pair) {
+    first  = pair.first;
+    second = pair.second;
+  }
+  KOKKOS_INLINE_FUNCTION
+  custom_pair(const volatile custom_pair& pair) {
+    first  = pair.first;
+    second = pair.second;
+  }
+  KOKKOS_INLINE_FUNCTION
+  custom_pair& operator=(const custom_pair& pair) {
+    first  = pair.first;
+    second = pair.second;
+    return *this;
+  }
+  KOKKOS_INLINE_FUNCTION
+  custom_pair& operator=(const volatile custom_pair& pair) {
+    first  = pair.first;
+    second = pair.second;
+    return *this;
+  }
+  KOKKOS_INLINE_FUNCTION
+  custom_pair& operator+=(const custom_pair& pair) {
+    first  += pair.first;
+    second += pair.second;
+    return *this;
+  }
+  KOKKOS_INLINE_FUNCTION
+  custom_pair& operator+=(const volatile custom_pair& pair) volatile {
+    first  += pair.first;
+    second += pair.second;
+    return *this;
+  }
+  KOKKOS_INLINE_FUNCTION
+  bool operator==(const custom_pair& pair) {
+    return ((first == pair.first) && (second == pair.second));
+  }
+};
+
 template<class local_ordinal_type, class DiagViewType>
 class ClassicalDropFunctor {
 private:
@@ -45,6 +95,20 @@ public:
 
     return (aij2 <= eps*eps * aiiajj);
   }
+  KOKKOS_INLINE_FUNCTION
+  scalar_type cacheDiagVal(local_ordinal_type i) const {
+    return diag(i,0);
+  }
+  // Return true if we drop, false if not
+  KOKKOS_FORCEINLINE_FUNCTION
+  bool operator()(scalar_type cachedDiagVal, local_ordinal_type col, scalar_type val) const {
+    // We avoid square root by using squared values
+    auto aiiajj = ATS::magnitude(cachedDiagVal) * ATS::magnitude(diag(col, 0));   // |a_ii|*|a_jj|
+    auto aij2   = ATS::magnitude(val)           * ATS::magnitude(val);            // |a_ij|^2
+
+    return (aij2 <= eps*eps * aiiajj);
+  }
+
 };
 
 template<class local_ordinal_type, class CoordsType>
@@ -120,74 +184,93 @@ private:
   typedef          Kokkos::ArithTraits<scalar_type>          ATS;
   typedef typename ATS::magnitudeType               magnitudeType;
 
+  typedef typename graph_type::execution_space          execution_space;
+  typedef typename Kokkos::TeamPolicy<execution_space>  team_policy;
+  typedef typename team_policy::member_type             team_member;
+
 public:
   ScalarFunctor(MatrixType A_, DropFunctorType dropFunctor_,
                 typename rows_type::non_const_type rows_,
                 typename cols_type::non_const_type colsAux_,
                 typename vals_type::non_const_type valsAux_,
-                bool reuseGraph_, bool lumping_, scalar_type threshold_) :
+                bool reuseGraph_, bool lumping_, scalar_type threshold_,
+                const int rows_per_team_) :
       A(A_),
       dropFunctor(dropFunctor_),
       rows(rows_),
       colsAux(colsAux_),
       valsAux(valsAux_),
       reuseGraph(reuseGraph_),
-      lumping(lumping_)
+      lumping(lumping_),
+      rows_per_team(rows_per_team_)
   {
-    rowsA = A.graph.row_map;
     zero = ATS::zero();
   }
 
   KOKKOS_INLINE_FUNCTION
-  void operator()(const local_ordinal_type row, local_ordinal_type& nnz) const {
-    auto rowView = A.rowConst(row);
-    auto length  = rowView.length;
-    auto offset  = rowsA(row);
+  void operator()(const team_member& dev, local_ordinal_type& nnz) const {
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(dev, 0, rows_per_team), [&](const local_ordinal_type& loop) {
+      const local_ordinal_type row = static_cast<local_ordinal_type>( dev.league_rank() ) * rows_per_team + loop;
+      if (row >= A.numRows ())
+        return;
 
-    scalar_type diag = zero;
-    local_ordinal_type rownnz = 0;
-    local_ordinal_type diagID = -1;
-    for (decltype(length) colID = 0; colID < length; colID++) {
-      local_ordinal_type col = rowView.colidx(colID);
-      scalar_type val = rowView.value (colID);
+      auto rowView    = A.rowConst(row);
+      auto row_length = rowView.length;
+      auto offset     = A.graph.row_map(row);
 
-      if (!dropFunctor(row, col, rowView.value(colID)) || row == col) {
-        colsAux(offset+rownnz) = col;
+      local_ordinal_type diagID = -1;
 
-        local_ordinal_type valID = (reuseGraph ? colID : rownnz);
-        valsAux(offset+valID) = val;
-        if (row == col)
-          diagID = valID;
+      using reduction_type = custom_pair<local_ordinal_type,scalar_type>;
 
-        rownnz++;
+      auto diagCacheRow = dropFunctor.cacheDiagVal(row);
 
-      } else {
-        // Rewrite with zeros (needed for reuseGraph)
-        valsAux(offset+colID) = zero;
-        diag += val;
+      reduction_type reduce_pair;
+      // Rule of thumb: vector length to be 1/3 of row length
+      Kokkos::parallel_reduce(Kokkos::ThreadVectorRange(dev, row_length), [&] (const local_ordinal_type& colID, reduction_type& local_reduce_pair) {
+        local_ordinal_type col = rowView.colidx(colID);
+        scalar_type        val = rowView.value (colID);
+
+        if (!dropFunctor(diagCacheRow, col, val) || row == col) {
+          colsAux(offset+colID) = col;
+          valsAux(offset+colID) = val;
+          if (row == col)
+            diagID = colID;
+
+          local_reduce_pair.first++;            // row_nnz++
+
+        } else {
+          colsAux(offset+colID) = -1;
+          valsAux(offset+colID) = zero;
+          local_reduce_pair.second += val;      // diag += val
+        }
+      }, reduce_pair);
+
+      if (diagID != -1) {
+        // Only thread that has diagonal is here
+        auto rownnz = reduce_pair.first;
+        auto diag   = reduce_pair.second;
+
+        // FIXME: How to assert on the device?
+        rows(row+1) = rownnz;
+        if (lumping) {
+          // Add diag to the diagonal
+
+          // NOTE_KOKKOS: valsAux was allocated with
+          // ViewAllocateWithoutInitializing. This is not a problem here
+          // because we explicitly set this value above.
+          valsAux(offset+diagID) += diag;
+        }
+
+        nnz += rownnz;
       }
-    }
-    // FIXME: How to assert on the device?
-    // assert(diagIndex != -1);
-    rows(row+1) = rownnz;
-    // if (lumping && diagID != -1)
-    if (lumping) {
-      // Add diag to the diagonal
-
-      // NOTE_KOKKOS: valsAux was allocated with
-      // ViewAllocateWithoutInitializing. This is not a problem here
-      // because we explicitly set this value above.
-      valsAux(offset+diagID) += diag;
-    }
-
-    nnz += rownnz;
+    });
   }
 
 private:
   MatrixType                            A;
   DropFunctorType                       dropFunctor;
 
-  rows_type                             rowsA;
+  const local_ordinal_type              rows_per_team;
 
   typename rows_type::non_const_type    rows;
   typename cols_type::non_const_type    colsAux;
@@ -208,7 +291,7 @@ void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordi
   using ATS               = Kokkos::ArithTraits<scalar_type>;
   using magnitude_type    = typename ATS::mag_type;
 
-  typedef Kokkos::RangePolicy<typename local_matrix_type::execution_space> range_type;
+  using execution_space   = typename local_matrix_type::execution_space;
 
   auto numRows = A.numRows();
   auto nnzA    = A.nnz();
@@ -223,6 +306,11 @@ void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordi
 
   local_ordinal_type nnzFA = 0;
 
+  const int rows_per_team = 10;     // FIXME: make a cmd-line argument
+
+  typedef Kokkos::RangePolicy<execution_space>  range_policy;
+  typedef Kokkos::TeamPolicy<execution_space>   team_policy;
+
   if (algo == "classical") {
     // Construct overlapped matrix diagonal
     Kokkos::View<double**,device_type> ghostedDiagView("ghosted_diag", numRows, 1);             // MultiVector
@@ -230,11 +318,16 @@ void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordi
 
     ClassicalDropFunctor<local_ordinal_type, decltype(ghostedDiagView)> dropFunctor(ghostedDiagView, threshold);
     ScalarFunctor<scalar_type, local_ordinal_type, local_matrix_type, decltype(dropFunctor)>
-        scalarFunctor(A, dropFunctor, rows, colsAux, valsAux, reuseGraph, lumping, threshold);
+        scalarFunctor(A, dropFunctor, rows, colsAux, valsAux, reuseGraph, lumping, threshold, rows_per_team);
 
-    Kokkos::parallel_reduce("main_loop", range_type(0,numRows), scalarFunctor, nnzFA);
+    // Rule of thumb for GPU: vector length (3rd parameter to team policy) to be 1/3 of row length, and has to be a power of 2
+    // 27 nonzeros in a row -> 8
+    Kokkos::parallel_reduce("main_loop", team_policy(numRows, Kokkos::AUTO, 8), scalarFunctor, nnzFA);
 
   } else if (algo == "distance laplacian") {
+#if 1
+    throw std::runtime_error("disable for now");
+#else
     // FIXME: create some coordinates
     Kokkos::View<scalar_type**,device_type> ghostedCoordsView("ghosted_coords", numRows, 3); // MultiVector
 
@@ -243,7 +336,7 @@ void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordi
     Kokkos::View<scalar_type*,device_type> lapl_diag("lapl_diag", numRows);
 
     // Construct Laplacian diagonal
-    Kokkos::parallel_for("construct_lapl_diag", range_type(0,numRows),
+    Kokkos::parallel_for("construct_lapl_diag", range_policy(0,numRows),
       KOKKOS_LAMBDA(const local_ordinal_type row) {
         auto rowView = A.graph.rowConst(row);
         auto length  = rowView.length;
@@ -261,13 +354,16 @@ void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordi
     DistanceLaplacianDropFunctor<local_ordinal_type, decltype(lapl_diag), decltype(distFunctor)>
         dropFunctor(lapl_diag, distFunctor, threshold);
     ScalarFunctor<scalar_type, local_ordinal_type, local_matrix_type, decltype(dropFunctor)>
-        scalarFunctor(A, dropFunctor, rows, colsAux, valsAux, reuseGraph, lumping, threshold);
+        scalarFunctor(A, dropFunctor, rows, colsAux, valsAux, reuseGraph, lumping, threshold, rows_per_team);
 
-    Kokkos::parallel_reduce("main_loop", range_type(0,numRows), scalarFunctor, nnzFA); // -> scan
+    Kokkos::parallel_reduce("main_loop", team_policy(numRows, Kokkos::AUTO, 32), scalarFunctor, nnzFA);
+#endif
   }
+  // std::cout << "Number of dropped entries = " << (1.0 - (double)nnzFA/nnzA) << std::endl;
 
+#if 0
   // parallel_scan (exclusive)
-  Kokkos::parallel_scan("compress_rows", range_type(0,numRows+1),
+  Kokkos::parallel_scan("compress_rows", range_policy(0,numRows+1),
     KOKKOS_LAMBDA(const local_ordinal_type i, local_ordinal_type& update, const bool& final_pass) {
       update += rows(i);
       if (final_pass)
@@ -281,7 +377,8 @@ void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordi
   // per row.
   cols_type cols(Kokkos::ViewAllocateWithoutInitializing("FA_cols"), nnzFA);
   vals_type vals(Kokkos::ViewAllocateWithoutInitializing("FA_vals"), nnzFA);
-  Kokkos::parallel_for("compress_cols_and_vals", range_type(0,numRows),
+  // Kokkos::parallel_reduce("main_loop", team_policy(numRows, Kokkos::AUTO, 32), scalarFunctor, nnzFA);
+  Kokkos::parallel_for("compress_cols_and_vals", range_policy(0,numRows),
     KOKKOS_LAMBDA(const local_ordinal_type i) {
       local_ordinal_type rowStart  = rows(i);
       local_ordinal_type rowAStart = rowsA(i);
@@ -291,6 +388,10 @@ void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordi
         vals(rowStart+j) = colsAux(rowAStart+j);
       }
   });
+#else
+  cols_type cols(Kokkos::ViewAllocateWithoutInitializing("FA_cols"), nnzFA);
+  vals_type vals(Kokkos::ViewAllocateWithoutInitializing("FA_vals"), nnzFA);
+#endif
 
   kokkos_graph_type kokkosGraph(cols, rows);
 }
