@@ -399,20 +399,19 @@ void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordi
 template<class scalar_type, class local_ordinal_type, class device_type>
 KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type>
 kernel_construct(local_ordinal_type numRows) {
+  const int nnzPerRow  = 27;
   auto numCols         = numRows;
-  auto nnz             = 10*numRows;
+  auto nnz             = nnzPerRow*numRows;
 
-  auto varianz_nel_row = 0.2*nnz/numRows;
+  auto varianz_nel_row = 0.2*nnzPerRow;
   auto width_row       = 0.01*numRows;
-
-  auto elements_per_row = nnz/numRows;
 
   auto rowPtr = new local_ordinal_type[numRows+1];
   rowPtr[0] = 0;
   for (int row = 0; row < numRows; row++) {
     int varianz = (1.0*rand()/INT_MAX-0.5)*varianz_nel_row;
 
-    rowPtr[row+1] = rowPtr[row] + elements_per_row + varianz;
+    rowPtr[row+1] = rowPtr[row] + nnzPerRow + varianz;
   }
   nnz = rowPtr[numRows];
 
