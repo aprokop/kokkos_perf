@@ -95,20 +95,6 @@ public:
 
     return (aij2 <= eps*eps * aiiajj);
   }
-  KOKKOS_INLINE_FUNCTION
-  scalar_type cacheDiagVal(local_ordinal_type i) const {
-    return diag(i,0);
-  }
-  // Return true if we drop, false if not
-  KOKKOS_FORCEINLINE_FUNCTION
-  bool operator()(scalar_type cachedDiagVal, local_ordinal_type col, scalar_type val) const {
-    // We avoid square root by using squared values
-    auto aiiajj = ATS::magnitude(cachedDiagVal) * ATS::magnitude(diag(col, 0));   // |a_ii|*|a_jj|
-    auto aij2   = ATS::magnitude(val)           * ATS::magnitude(val);            // |a_ij|^2
-
-    return (aij2 <= eps*eps * aiiajj);
-  }
-
 };
 
 template<class local_ordinal_type, class CoordsType>
@@ -222,31 +208,22 @@ public:
 
       using reduction_type = custom_pair<local_ordinal_type,scalar_type>;
 
-      auto diagCacheRow = dropFunctor.cacheDiagVal(row);
-
       reduction_type reduce_pair;
       // Rule of thumb: vector length to be 1/3 of row length
       Kokkos::parallel_reduce(Kokkos::ThreadVectorRange(dev, row_length), [&] (const local_ordinal_type& colID, reduction_type& local_reduce_pair) {
         local_ordinal_type col = rowView.colidx(colID);
         scalar_type        val = rowView.value (colID);
 
-        if (!dropFunctor(diagCacheRow, col, val) || row == col) {
-          colsAux(offset+colID) = col;
-          valsAux(offset+colID) = val;
-          if (row == col)
-            diagID = colID;
-
-          local_reduce_pair.first++;            // row_nnz++
-
-        } else {
-          colsAux(offset+colID) = -1;
-          valsAux(offset+colID) = zero;
-          local_reduce_pair.second += val;      // diag += val
-        }
+        bool keep = !dropFunctor(row, col, val) || row == col;
+        colsAux(offset+colID)       = (keep ? col : -1);
+        valsAux(offset+colID)       = (keep ? val : zero);
+        local_reduce_pair.first    += (keep ?    1 : 0);            // row_nnz++
+        local_reduce_pair.second   += (keep ? zero : val);          // diag += val
+        diagID                      = (row == col ? colID : diagID);
       }, reduce_pair);
 
       if (diagID != -1) {
-        // Only thread that has diagonal is here
+        // Only thread that has the diagonal is here
         auto rownnz = reduce_pair.first;
         auto diag   = reduce_pair.second;
 
@@ -281,8 +258,58 @@ private:
   scalar_type                           zero;
 };
 
+template<class execution_space>
+int64_t cd_launch_parameters(int64_t numRows, int64_t nnz, int64_t rows_per_thread, int& team_size, int& vector_length) {
+  int64_t rows_per_team;
+  int64_t nnz_per_row = nnz/numRows;
+
+  if (nnz_per_row < 1)
+    nnz_per_row = 1;
+
+  const int magic_value = 2;
+
+  if (vector_length < 1) {
+    vector_length = 1;
+    while (vector_length < 32 && vector_length*magic_value < nnz_per_row)
+      vector_length *= 2;
+  }
+
+  // Determine rows per thread
+  if (rows_per_thread < 1) {
+    #ifdef KOKKOS_HAVE_CUDA
+    if (std::is_same<Kokkos::Cuda,execution_space>::value)
+      rows_per_thread = 1;
+    else
+    #endif
+    {
+      if (nnz_per_row < 20 && nnz > 5000000 ) {
+        rows_per_thread = 256;
+      } else
+        rows_per_thread = 64;
+    }
+  }
+
+  #ifdef KOKKOS_HAVE_CUDA
+  if (team_size < 1)
+    team_size = 256/vector_length;
+  #endif
+
+  rows_per_team = rows_per_thread * team_size;
+
+  if (rows_per_team < 0) {
+    int64_t nnz_per_team = 4096;
+    int64_t conc = execution_space::concurrency();
+    while((conc * nnz_per_team * 4> nnz)&&(nnz_per_team>256)) nnz_per_team/=2;
+    rows_per_team = (nnz_per_team+nnz_per_row - 1)/nnz_per_row;
+  }
+
+
+  return rows_per_team;
+}
+
+
 template<class scalar_type, class local_ordinal_type, class device_type>
-void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type> A, const std::string& algo, scalar_type threshold, bool lumping) {
+void kernel_coalesce_drop_device(int loop_cnt, KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type> A, const std::string& algo, scalar_type threshold, bool lumping, int rows_per_team, int vector_length) {
   using local_matrix_type = KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type>;
   using kokkos_graph_type = typename LWGraph_kokkos<local_ordinal_type,device_type>::local_graph_type;
   using rows_type         = typename kokkos_graph_type::row_map_type::non_const_type;
@@ -306,10 +333,23 @@ void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordi
 
   local_ordinal_type nnzFA = 0;
 
-  const int rows_per_team = 10;     // FIXME: make a cmd-line argument
-
   typedef Kokkos::RangePolicy<execution_space>  range_policy;
-  typedef Kokkos::TeamPolicy<execution_space>   team_policy;
+
+  int team_size = -1;
+  if (vector_length < 0 || rows_per_team < 0) {
+    int64_t rows_per_thread = -1;
+    rows_per_team = cd_launch_parameters<execution_space>(A.numRows(), A.nnz(), rows_per_thread, team_size, vector_length);
+
+    if (loop_cnt == 0) {
+      std::cout << "team_size     = " << team_size     << std::endl;
+      std::cout << "rows_per_team = " << rows_per_team << std::endl;
+      std::cout << "vector_length = " << vector_length << std::endl;
+    }
+  }
+
+  Kokkos::TeamPolicy<execution_space, Kokkos::Schedule<Kokkos::Static> > team_policy(1,1);
+  if (team_size < 0) team_policy = Kokkos::TeamPolicy<execution_space, Kokkos::Schedule<Kokkos::Static> > (numRows, Kokkos::AUTO, vector_length);
+  else               team_policy = Kokkos::TeamPolicy<execution_space, Kokkos::Schedule<Kokkos::Static> > (numRows, team_size,    vector_length);
 
   if (algo == "classical") {
     // Construct overlapped matrix diagonal
@@ -321,13 +361,9 @@ void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordi
         scalarFunctor(A, dropFunctor, rows, colsAux, valsAux, reuseGraph, lumping, threshold, rows_per_team);
 
     // Rule of thumb for GPU: vector length (3rd parameter to team policy) to be 1/3 of row length, and has to be a power of 2
-    // 27 nonzeros in a row -> 8
-    Kokkos::parallel_reduce("main_loop", team_policy(numRows, Kokkos::AUTO, 8), scalarFunctor, nnzFA);
+    Kokkos::parallel_reduce("main_loop", team_policy, scalarFunctor, nnzFA);
 
   } else if (algo == "distance laplacian") {
-#if 1
-    throw std::runtime_error("disable for now");
-#else
     // FIXME: create some coordinates
     Kokkos::View<scalar_type**,device_type> ghostedCoordsView("ghosted_coords", numRows, 3); // MultiVector
 
@@ -356,8 +392,7 @@ void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordi
     ScalarFunctor<scalar_type, local_ordinal_type, local_matrix_type, decltype(dropFunctor)>
         scalarFunctor(A, dropFunctor, rows, colsAux, valsAux, reuseGraph, lumping, threshold, rows_per_team);
 
-    Kokkos::parallel_reduce("main_loop", team_policy(numRows, Kokkos::AUTO, 32), scalarFunctor, nnzFA);
-#endif
+    Kokkos::parallel_reduce("main_loop", team_policy, scalarFunctor, nnzFA);
   }
   // std::cout << "Number of dropped entries = " << (1.0 - (double)nnzFA/nnzA) << std::endl;
 
@@ -399,7 +434,7 @@ void kernel_coalesce_drop_device(KokkosSparse::CrsMatrix<scalar_type, local_ordi
 template<class scalar_type, class local_ordinal_type, class device_type>
 KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type>
 kernel_construct(local_ordinal_type numRows) {
-  const int nnzPerRow  = 27;
+  const int nnzPerRow  = 7;
   auto numCols         = numRows;
   auto nnz             = nnzPerRow*numRows;
 
@@ -415,8 +450,8 @@ kernel_construct(local_ordinal_type numRows) {
   }
   nnz = rowPtr[numRows];
 
-  auto colInd = new local_ordinal_type[nnz];
-  auto values = new scalar_type       [nnz];
+  std::vector<local_ordinal_type> colInd(nnz);
+  std::vector<scalar_type>        values(nnz);
   for (int row = 0; row < numRows; row++) {
     for (int k = rowPtr[row]; k < rowPtr[row+1]; k++) {
       int pos = row + (1.0*rand()/INT_MAX-0.5)*width_row;
@@ -430,27 +465,41 @@ kernel_construct(local_ordinal_type numRows) {
 
   typedef KokkosSparse::CrsMatrix<scalar_type, local_ordinal_type, device_type> local_matrix_type;
 
-  return local_matrix_type("A", numRows, numCols, nnz, values, rowPtr, colInd, false/*pad*/);
+  return local_matrix_type("A", numRows, numCols, nnz, values.data(), rowPtr, colInd.data(), false/*pad*/);
 }
 
-template<class scalar_type, class local_ordinal_type, class device_type>
-int main_(int argc, char **argv) {
+int main(int argc, char* argv[]) {
+  Kokkos::initialize(argc, argv);
+
+  using scalar_type         = double;
+  using local_ordinal_type  = int;
+  using execution_space     = Kokkos::DefaultExecutionSpace;
+  using device_type         = Kokkos::Device<execution_space,typename execution_space::memory_space>;
+
+  srand(13721);
+
   int n         = 100000;
   int num_loops = 10;
 
-  bool lumping = true;
-  scalar_type eps = 0.05;
-  std::string algo = "classical";
+  bool lumping      = true;
+  scalar_type eps   = 0.05;
+  std::string algo  = "classical";
+  int rows_per_team = -1;
+  int vector_length = -1;
+  bool study = false;
 
   for (int i = 1; i < argc; i++) {
-    if      (strcmp(argv[i], "-n") == 0)                                   { n    = atoi(argv[++i]); continue; }
-    else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--num_loops") == 0) { num_loops = atoi(argv[++i]); continue; }
-    else if (strcmp(argv[i], "--node") == 0)                               { i++; continue; }
-    else if (strcmp(argv[i], "--lumping") == 0)                            { i++; lumping = true; continue; }
-    else if (strcmp(argv[i], "--no-lumping") == 0)                         { i++; lumping = false; continue; }
-    else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--algo") == 0) { algo = argv[++i]; continue; }
-    else if (strcmp(argv[i], "-e") == 0 || strcmp(argv[i], "--eps") == 0)  { eps = atof(argv[++i]); continue; }
-    else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+    if      (!strcmp(argv[i], "-n") )                                       { n = atoi(argv[++i]); }
+    else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--num_loops"))     { num_loops = atoi(argv[++i]); }
+    else if (                          !strcmp(argv[i], "--node"))          { }
+    else if (                          !strcmp(argv[i], "--lumping"))       { lumping = true; }
+    else if (                          !strcmp(argv[i], "--no-lumping"))    { lumping = false; }
+    else if (!strcmp(argv[i], "-r") || !strcmp(argv[i], "--rows_per_team")) { rows_per_team = atoi(argv[++i]); }
+    else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--vector_length")) { vector_length = atoi(argv[++i]); }
+    else if (!strcmp(argv[i], "-a") || !strcmp(argv[i], "--algo"))          { algo = argv[++i]; }
+    else if (!strcmp(argv[i], "-e") || !strcmp(argv[i], "--eps"))           { eps = atof(argv[++i]); }
+    else if (                          !strcmp(argv[i], "--study"))         { study = true; }
+    else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
       std::cout << "./coalesce_drop.exe [-n <matrix_size>] [-l <number_of_loops>]" << std::endl;
       return 0;
     } else {
@@ -460,72 +509,50 @@ int main_(int argc, char **argv) {
   if (algo != "classical" && algo != "distance_laplacian")
     throw std::runtime_error("Unknown algo: \"" + algo + "\"");
 
-  std::cout << "n = " << n << ", num_loops = " << num_loops << ", algo = " << algo << ", eps = " << eps << ", lumping = " << lumping << std::endl;
-
-  typedef typename device_type::execution_space execution_space;
+  std::cout << "Cmd line parameters:\n"
+      << "\tn             = " << n << "\n"
+      << "\tnum_loops     = " << num_loops << "\n"
+      << "\talgo          = " << algo << "\n"
+      << "\teps           = " << eps << "\n"
+      << "\tlumping       = " << lumping << "\n"
+      << "\trows_per_team = " << rows_per_team << "\n"
+      << "\tvector_length = " << vector_length << std::endl;
 
   auto A = kernel_construct<scalar_type, local_ordinal_type, device_type>(n);
 
-  {
+  if (!study) {
     execution_space::fence();
     Kokkos::Impl::Timer timer;
 
     for (int i = 0; i < num_loops; i++)
-      kernel_coalesce_drop_device(A, algo, eps, lumping);
+      kernel_coalesce_drop_device(i, A, algo, eps, lumping, rows_per_team, vector_length);
 
     double kernel_time = timer.seconds();
     execution_space::fence();
 
     printf("kernel_coalesce_drop: %.2e (s)\n", kernel_time / num_loops);
+
+  } else {
+    printf("r\\v |%10d%10d%10d%10d%10d%10d\n", 1, 2, 4, 8, 16, 32);
+    for (int r = 1; r <= 64; r *= 2) {
+      printf("%2d  |", r);
+      for (int v = 1; v <= 32; v *= 2) {
+        execution_space::fence();
+        Kokkos::Impl::Timer timer;
+
+        for (int i = 0; i < num_loops; i++)
+          kernel_coalesce_drop_device(i, A, algo, eps, lumping, r, v);
+
+        double kernel_time = timer.seconds();
+        execution_space::fence();
+
+        printf("%10.2e", kernel_time / num_loops);
+      }
+      printf("\n");
+    }
   }
 
   execution_space::finalize();
-
-  return 0;
-}
-
-int main(int argc, char* argv[]) {
-  Kokkos::initialize(argc, argv);
-
-  srand(13721);
-
-  std::string node;
-  for (int i = 1; i < argc; i++) {
-    if (strncmp(argv[i], "--node=", 7) == 0) {
-      std::cout << "Use --node <node> instead of --node=<node>" << std::endl;
-      Kokkos::finalize();
-      return 0;
-
-    } else if (strncmp(argv[i], "--node", 6) == 0)
-      node = argv[++i];
-  }
-
-  std::cout << "node = " << (node == "" ? "default" : node) << std::endl;
-
-  if (node == "") {
-    return main_<double,int,Kokkos::DefaultExecutionSpace>(argc, argv);
-
-  } else if (node == "serial") {
-#ifdef KOKKOS_HAVE_SERIAL
-    return main_<double,int,Kokkos::Serial>(argc, argv);
-#else
-    std::cout << "Error: Serial node type is disabled" << std::endl;
-#endif
-
-  } else if (node == "openmp") {
-#ifdef KOKKOS_HAVE_OPENMP
-    return main_<double,int,Kokkos::OpenMP>(argc, argv);
-#else
-    std::cout << "Error: OpenMP node type is disabled" << std::endl;
-#endif
-
-  } else if (node == "cuda") {
-#ifdef KOKKOS_HAVE_CUDA
-    return main_<double,int,Kokkos::Cuda>(argc, argv);
-#else
-    std::cout << "Error: CUDA node type is disabled" << std::endl;
-#endif
-  }
 
   Kokkos::finalize();
 
