@@ -1,0 +1,8 @@
+*.exe
+*.o
+*.a
+*.tmp
+*.host
+*.cuda
+KokkosCore_config.h
+KokkosKernels_config.h
