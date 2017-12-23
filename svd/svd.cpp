@@ -159,11 +159,6 @@ public:
         V(i,j) = (i == j ? 1.0 : 0.0);
       }
 
-    // FIXME: Scale original matrix
-    // auto norm_a = norm(E);
-    // auto scale = norm_a > 0.0 ? norm_a : scalar_type(1.0);
-    // scale_matrix(E, 1./scale);
-
     auto norm = norm_F_wo_diag(E);
     auto tol  = ATS::epsilon();
 
