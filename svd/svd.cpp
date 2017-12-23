@@ -1,9 +1,9 @@
 #include <Kokkos_Core.hpp>
-#include <impl/Kokkos_Timer.hpp>
 
 #include <Kokkos_ArithTraits.hpp>
 
 #include <cassert>
+#include <chrono>
 #include <iostream>
 
 using execution_space   = Kokkos::DefaultExecutionSpace;
@@ -309,29 +309,31 @@ int main(int argc, char* argv[]) {
 
   {
     execution_space::fence();
-    Kokkos::Impl::Timer timer;
+    auto start = std::chrono::high_resolution_clock::now();
 
     build_random_matrices(num_matrices, N, As);
 
-    double kernel_time = timer.seconds();
     execution_space::fence();
+    auto end = std::chrono::high_resolution_clock::now();
 
-    printf("build: %.2e (s)\n", kernel_time);
+    std::chrono::duration<double> elapsed = end - start;
+    printf("build: %.2e (s)\n", elapsed.count());
   }
 
   matrices_type pseudoAs("pseudoAs", As.extent(0));
 
   {
     execution_space::fence();
-    Kokkos::Impl::Timer timer;
+    auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < num_loops; i++)
       kernel_svd(num_matrices, N, As, pseudoAs);
 
-    double kernel_time = timer.seconds();
     execution_space::fence();
+    auto end = std::chrono::high_resolution_clock::now();
 
-    printf("kernel_svd: %.2e (s)\n", kernel_time / num_loops);
+    std::chrono::duration<double> elapsed = end - start;
+    printf("kernel_svd: %.2e (s)\n", elapsed.count() / num_loops);
   }
 
   // Check the solution
