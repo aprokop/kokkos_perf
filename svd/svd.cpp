@@ -28,8 +28,15 @@ public:
   }
 
   KOKKOS_INLINE_FUNCTION
+  int sgn_plus( double x ) const {
+    if ( x < 0.0 )
+      return -1;
+    return 1;
+  }
+
+  KOKKOS_INLINE_FUNCTION
   void givens_left(shared_matrix& A, scalar_type c, scalar_type s, int i, int k) const {
-    auto n = A.extent(0);
+    auto n = A.extent_int(0);
 
     for (int j = 0; j < n; j++) {
       auto aij = A(i,j);
@@ -41,7 +48,7 @@ public:
 
   KOKKOS_INLINE_FUNCTION
   void givens_right(shared_matrix& A, scalar_type c, scalar_type s, int i, int k) const {
-    auto n = A.extent(0);
+    auto n = A.extent_int(0);
 
     for (int j = 0; j < n; ++j) {
       auto aji = A(j,i);
@@ -97,13 +104,16 @@ public:
     auto dif = sqrt((AAt[0][0] - AAt[1][1])*(AAt[0][0] - AAt[1][1]) + 4*AAt[0][1]*AAt[1][0]);
     E = { { { sqrt(0.5*(sum + dif)), 0 }, { 0, sqrt(0.5*(sum - dif)) } } };
 
-    // Find the correction matrix for the right side
+    // Find the correction matrix for the right side (S = U'*A*W)
     matrix_2x2_type Ut, AW, S;
     mult_2x2(A, W, AW);
     trans_2x2(U, Ut);
     mult_2x2(Ut, AW, S);
 
-    matrix_2x2_type C = { { { scalar_type(sgn(S[0][0])), 0.0 }, { 0.0, scalar_type(sgn(S[1][1])) } } };
+    // We need sgn_plus here to work with singular systems. Using the
+    // regular sgn will produce a singular C which would lead to singular V.
+    matrix_2x2_type C = { { { scalar_type(sgn_plus(S[0][0])), 0.0 },
+                            { 0.0, scalar_type(sgn_plus(S[1][1])) } } };
 
     mult_2x2(W, C, V);
 
@@ -112,7 +122,7 @@ public:
 
   KOKKOS_INLINE_FUNCTION
   void argmax_off_diagonal(shared_matrix::const_type A, int& p, int& q) const {
-    auto n = A.extent(0);
+    auto n = A.extent_int(0);
 
     p = q = -1;
     mag_type max = -1;
@@ -127,7 +137,7 @@ public:
 
   KOKKOS_INLINE_FUNCTION
   mag_type norm_F_wo_diag(shared_matrix::const_type A) const {
-    auto n = A.extent(0);
+    auto n = A.extent_int(0);
 
     mag_type norm = 0.0;
     for (int i = 0; i < n; i++)
@@ -200,8 +210,9 @@ public:
     assert(num_iter < max_iter);
 
     // Compute pseudo-inverse (pseudoA = V pseudoE U^T)
-    // NOTE: the V stored above is actually V^T, but we don't transpose it,
-    // instead we modify the MxM loop to do (pseudoA = V^T pseudoE U^T)
+    // NOTE: the V stored above is actually V^T, but we don't explicitly
+    // transpose it. Instead, we modify the MxM loop below to do (pseudoA = V^T
+    // pseudoE U^T)
     for (int i = 0; i < n; i++)
       for (int j = 0; j < n; j++) {
         scalar_type value = 0;
@@ -213,7 +224,7 @@ public:
 
   // amount of shared memory
   size_t team_shmem_size(int team_size) const {
-    return 3*shared_matrix::shmem_size(n, n);    // U, E, V
+    return team_size * 3 *shared_matrix::shmem_size(n, n);    // U, E, V
   }
 
 private:
