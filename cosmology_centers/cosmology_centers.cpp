@@ -24,8 +24,30 @@ float distance(Point const &a, Point const &b) {
 }
 
 template <typename ExecutionSpace, typename MemorySpace>
+void exclusivePrefixSum(ExecutionSpace const &exec_space,
+                        Kokkos::View<int *, MemorySpace> v) {
+  auto const n = v.extent(0);
+  Kokkos::parallel_scan("exclusive_scan",
+                        Kokkos::RangePolicy<ExecutionSpace>(exec_space, 0, n),
+                        KOKKOS_LAMBDA(int i, int &update, bool final_pass) {
+                          auto const in = v(i);
+                          if (final_pass) v(i) = update;
+                          update += in;
+                        });
+}
+
+template <typename MemorySpace>
+int lastElement(Kokkos::View<int *, MemorySpace> const &v) {
+  auto const n = v.extent(0);
+  auto v_subview = Kokkos::subview(v, n - 1);
+  auto v_host = Kokkos::create_mirror_view(v_subview);
+  Kokkos::deep_copy(v_host, v_subview);
+  return v_host();
+}
+
+template <typename ExecutionSpace, typename MemorySpace>
 void constructProblem(ExecutionSpace const &exec_space, int num_points,
-                      int num_halos, int halo_size,
+                      int num_halos, int halo_size, bool uniform_halo_sizes,
                       Kokkos::View<Point *, MemorySpace> &points,
                       Kokkos::View<int *, MemorySpace> &offsets,
                       Kokkos::View<int *, MemorySpace> &indices) {
@@ -40,15 +62,25 @@ void constructProblem(ExecutionSpace const &exec_space, int num_points,
         points(i) = Point{0.f, 0.f, 0.f};
       });
 
+  Kokkos::Random_XorShift1024_Pool<MemorySpace> rand_pool(5374857);
+
   Kokkos::resize(Kokkos::WithoutInitializing, offsets, num_halos + 1);
   Kokkos::parallel_for(
       "construct_offsets",
       Kokkos::RangePolicy<ExecutionSpace>(exec_space, 0, offsets.extent(0)),
-      KOKKOS_LAMBDA(int i) { offsets(i) = i * halo_size; });
+      KOKKOS_LAMBDA(int i) {
+        if (uniform_halo_sizes) {
+          offsets(i) = halo_size;
+        } else {
+          auto rand_gen = rand_pool.get_state();
+          offsets(i) = rand_gen.urand() % halo_size;
+          if (offsets(i) == 0) offsets(i) = 1;
+          rand_pool.free_state(rand_gen);
+        }
+      });
+  exclusivePrefixSum(exec_space, offsets);
 
-  Kokkos::Random_XorShift1024_Pool<MemorySpace> rand_pool(5374857);
-
-  Kokkos::resize(Kokkos::WithoutInitializing, indices, num_halos * halo_size);
+  Kokkos::resize(Kokkos::WithoutInitializing, indices, lastElement(offsets));
   Kokkos::parallel_for(
       "construct_indices",
       Kokkos::RangePolicy<ExecutionSpace>(exec_space, 0, num_halos),
@@ -178,8 +210,7 @@ Kokkos::View<int *, MemorySpace> computeMinPotential2(
       Kokkos::view_alloc(Kokkos::WithoutInitializing, "min_potential_indices"),
       num_halos);
   Kokkos::parallel_for(
-      "compute_galaxy_centers_1",
-      TeamPolicy(exec_space, num_halos, Kokkos::AUTO),
+      "compute_galaxy_centers_1", TeamPolicy(exec_space, num_halos, Kokkos::AUTO),
       KOKKOS_LAMBDA(typename TeamPolicy::member_type const &team) {
         auto const halo_index = team.league_rank();
 
@@ -241,14 +272,17 @@ int main(int argc, char *argv[]) {
   int num_points = 30000000;
   int num_halos = 1000000;
   int halo_size = 10000;
+  bool uniform_halo_sizes = true;
 
-  for (int i = 1; i < argc; i++) {
+  for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--num-points"))
       num_points = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--num-halos"))
       num_halos = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--halo-size"))
       halo_size = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--variable-halo-sizes"))
+      uniform_halo_sizes = false;
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
       std::cout << "./cosmology_centers.exe [-n <number_of_halos>] [-s "
                    "<halo_size>]"
@@ -260,21 +294,22 @@ int main(int argc, char *argv[]) {
 
   printf("number of points          : %d\n", num_points);
   printf("number of halos           : %d\n", num_halos);
-  printf("halo size                 : %d\n", halo_size);
+  printf("halo size                 : %d [%s]\n", halo_size,
+         (uniform_halo_sizes ? "uniform" : "variable"));
 
   ExecutionSpace exec_space;
 
   Kokkos::View<Point *, MemorySpace> points("points", 0);
   Kokkos::View<int *, MemorySpace> offsets("offsets", 0);
   Kokkos::View<int *, MemorySpace> indices("indices", 0);
-  constructProblem(exec_space, num_points, num_halos, halo_size, points,
-                   offsets, indices);
+  constructProblem(exec_space, num_points, num_halos, halo_size,
+                   uniform_halo_sizes, points, offsets, indices);
 
   Kokkos::Timer timer;
 
   Kokkos::View<int *, MemorySpace> min_potential_indices(
       "min_potential_indices", 0);
-  for (int variant = 0; variant < 2; ++variant) {
+  for (int variant = 1; variant < 2; ++variant) {
     exec_space.fence();
     timer.reset();
     switch (variant) {
