@@ -415,8 +415,8 @@ int main(int argc, char *argv[])
       uniform_halo_sizes = false;
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help"))
     {
-      std::cout << "./cosmology_centers.exe [-n <number_of_halos>] [-s "
-                   "<halo_size>]"
+      std::cout << "./cosmology_centers.exe [--num-halos <number_of_halos>] [--halo-size "
+                   "<halo_size>] [--variable-halo-sizes]"
                 << std::endl;
       return 0;
     }
